@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# ============================================================================ #
+# This CLI tool is a working reference implementation for generating TLS
+# private keys, certificate signing requests (CSRs), and self-signed
+# certificates. The benefits of using this tool vs OpenSSL directly are as
+# follows:
+#
+#  * Significantly easier to use than OpenSSL.
+#
+#  * Strong keys by default (ECC with secp384r1 curve).
+#
+#  * Support for SubjectAlternativeName extension by default (a requirement
+#    for certificates to be trusted by Google Chrome and others), which is
+#    very tedious to enable using OpenSSL natively.
+#
+#  * Self-signed certificate can be upgraded to CA-signed certificate at
+#    any time (because CSR for self-signed certificate is not removed).
+#
+# By default, files are output to the current working directory. To override
+# this, set the TARGET_DIR environment variable when running this command.
+# ---------------------------------------------------------------------------- #
+
+[ -z "${TARGET_DIR}" ] && TARGET_DIR=$(pwd)
+
+command() {
+  local COMMAND=$1
+
+  shift
+
+  case "${COMMAND}" in
+    key)
+      command_key
+      ;;
+    request)
+      command_request $*
+      ;;
+    reset)
+      command_reset $*
+      ;;
+    sign)
+      command_sign
+      ;;
+    *)
+      >&2 cat <<-EOF
+USAGE: $0 (key|request|reset|sign)
+
+CLI tool for generating TLS private keys, certificate signing requests, and
+self-signed certificates.
+
+ * key: Generate a private key for use with TLS.
+ * request: Generate a certificate signing request (CSR) for an existing private key and given domain.
+ * reset: Generate a new private key and self-signed certificate for a given domain.
+ * sign: Create a self-signed certificate for an existing certificate signing request and private key.
+
+EOF
+      exit 1
+      ;;
+  esac
+}
+
+command_key() {
+  openssl ecparam \
+    -genkey \
+    -out "${TARGET_DIR}/tls.key" \
+    -name secp384r1
+}
+
+command_request() {
+  local DOMAIN=$1
+
+  if [ -z "${DOMAIN}" ]; then
+    >&2 cat <<-EOF
+USAGE: $0 request <domain>
+
+Generates a certificate signing request for the *tls.key* file within the
+target directory.
+
+ * domain: (string, required) - The domain for which to generate a certificate request.
+
+EOF
+    exit 1
+  fi
+
+  if [ ! -f "${TARGET_DIR}/tls.key" ]; then
+    >&2 cat <<-EOF
+FileNotFound: Expected a private key to exist at the following path:
+
+    ${TARGET_DIR}/tls.key
+
+Run "$0 key" then try again.
+
+EOF
+    exit 1
+  fi
+
+  openssl req \
+    -new \
+    -utf8 \
+    -sha256 \
+    -subj "/CN=${DOMAIN}" \
+    -out "${TARGET_DIR}/tls.csr" \
+    -key "${TARGET_DIR}/tls.key" \
+    -reqexts SAN \
+    -config <(cat /etc/ssl/openssl.cnf <(printf "\n[SAN]\nsubjectAltName=DNS:${DOMAIN}\n"))
+}
+
+command_reset() {
+  local DOMAIN=$1
+
+  if [ -z "${DOMAIN}" ]; then
+    >&2 cat <<-EOF
+USAGE: $0 reset <domain>
+
+Generates a private key, certificate signing request (CSR), and self-signed certificate.
+
+ * domain: (string, required) - The domain for which to generate a key and self-signed certificate.
+
+EOF
+    exit 1
+  fi
+
+  set -e
+
+  command_key
+  command_request "${DOMAIN}"
+  command_sign
+}
+
+command_sign() {
+  if [ ! -f "${TARGET_DIR}/tls.key" ]; then
+    >&2 cat <<-EOF
+FileNotFound: Expected a private key to exist at the following path:
+
+    ${TARGET_DIR}/tls.key
+
+Run "$0 key" then try again.
+
+EOF
+    exit 1
+  fi
+
+  if [ ! -f "${TARGET_DIR}/tls.csr" ]; then
+    >&2 cat <<-EOF
+FileNotFound: Expected a certificate signing request to exist at the following path:
+
+    ${TARGET_DIR}/tls.csr
+
+Run "$0 request <domain>" and try again.
+
+EOF
+  fi
+
+  openssl x509 \
+    -req \
+    -sha256 \
+    -in "${TARGET_DIR}/tls.csr" \
+    -out "${TARGET_DIR}/tls.crt" \
+    -signkey "${TARGET_DIR}/tls.key" \
+    -days 365
+}
+
+command $*
